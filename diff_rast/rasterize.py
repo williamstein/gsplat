@@ -7,6 +7,7 @@ from typing import Tuple
 import numpy as np
 import torch
 from jaxtyping import Float
+from PIL import Image
 from torch import Tensor
 from torch.autograd import Function
 
@@ -207,8 +208,6 @@ class rasterize(Function):
 
 # helper to save image
 def vis_image(image, image_path):
-    from PIL import Image
-
     """Generic image saver"""
     if torch.is_tensor(image):
         image = image.detach().cpu().numpy() * 255
