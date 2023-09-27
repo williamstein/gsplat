@@ -1,6 +1,8 @@
 import math
 import os
 import random
+from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -12,21 +14,47 @@ from diff_rast.rasterize import RasterizeGaussians
 from diff_rast.project_gaussians import ProjectGaussians
 
 
+@dataclass
+class Camera:
+    viewmat: Tensor
+    name: str
+
+    def to(self, device):
+        return Camera(self.viewmat.to(device), self.name)
+
+@dataclass
+class PosedImage:
+    image: Tensor
+    camera: Camera
+
+    def to(self, device):
+        return PosedImage(self.image.to(device), self.camera.to(device))
+
+
 class SimpleTrainer:
     """Trains random gaussians to fit an image."""
 
     def __init__(
         self,
-        gt_image: Tensor,
+        # gt_image: Tensor,
+        data: list[PosedImage],
+        debug_cameras: Optional[list[Camera]] = None,
         num_points: int = 2000,
     ):
+        debug_cameras = debug_cameras or []
+        if len(data) == 0:
+            raise ValueError("Must have at least one image")
+        self.H, self.W = data[0].image.shape[0], data[0].image.shape[1]
+        if not all(image.shape == (self.H, self.W) for image in data):
+            raise ValueError("All images must have the same shape")
         self.device = torch.device("cuda:0")
-        self.gt_image = gt_image.to(device=self.device)
+        # self.gt_image = gt_image.to(device=self.device)
         self.num_points = num_points
+        self.data = [posed_image.to(self.device) for posed_image in data]
+        self.debug_cameras = [camera.to(self.device) for camera in debug_cameras]
 
         BLOCK_X, BLOCK_Y = 16, 16
         fov_x = math.pi / 2.0
-        self.H, self.W = gt_image.shape[0], gt_image.shape[1]
         self.focal = 0.5 * float(self.W) / math.tan(0.5 * fov_x)
         self.tile_bounds = (self.W + BLOCK_X - 1) // BLOCK_X, (self.H + BLOCK_Y - 1) // BLOCK_Y, 1
         self.img_size = torch.tensor([self.W, self.H, 1], device=self.device)
@@ -66,16 +94,33 @@ class SimpleTrainer:
                 device=self.device,
             )
 
-        self.viewmat = torch.tensor(
-            [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 8.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-            device=self.device,
-        )
-        self.means.requires_grad = False
+        # self.viewmat = torch.tensor(
+        #     [
+        #         [1.0, 0.0, 0.0, 0.0],
+        #         [0.0, 1.0, 0.0, 0.0],
+        #         [0.0, 0.0, 1.0, 8.0],
+        #         [0.0, 0.0, 0.0, 1.0],
+        #     ],
+        #     device=self.device,
+        # )
+        # self.viewmat2 = torch.tensor(
+        #     [
+        #         [ 0.,  0.,  1.,  8.],
+        #         [ 0.,  1.,  0.,  0.],
+        #         [-1.,  0.,  0.,  0.],
+        #         [ 0.,  0.,  0.,  1.]
+        #     ]
+        # )
+        # theta = np.pi / 4
+        # self.viewmat3 = torch.tensor(
+        #     [
+        #         [ np.cos(theta),  0.,  np.sin(theta),  4.],
+        #         [ 0.,             1.,  0.,             0.],
+        #         [-np.sin(theta),  0.,  np.cos(theta),  4.],
+        #         [ 0.,             0.,  0.,             1.]
+        #     ]
+        # )
+        self.means.requires_grad = True
         self.scales.requires_grad = False
         self.quats.requires_grad = False
         self.rgbs.requires_grad = True
@@ -95,15 +140,17 @@ class SimpleTrainer:
     def train(self, iterations: int = 1000, lr: float = 0.01, save_imgs: bool = True):
         optimizer = optim.Adam([self.rgbs,self.means,self.scales,self.opacities,self.quats], lr)  # try training self.opacities/scales etc.
         mse_loss = torch.nn.MSELoss()
-        frames = []
-        for iter in range(iterations):
+        name_to_frames = defaultdict(list)
+        # frames = []
+
+        def _compute_out_image(viewmat):
             xys, depths, radii, conics, num_tiles_hit = ProjectGaussians.apply(
                 self.means,
                 self.scales,
                 1,
                 self.quats,
-                self.viewmat,
-                self.viewmat,
+                viewmat,
+                viewmat,
                 self.focal,
                 self.focal,
                 self.H,
@@ -111,8 +158,23 @@ class SimpleTrainer:
                 self.tile_bounds,
             )
 
-            out_img = RasterizeGaussians.apply(xys, depths, radii, conics, num_tiles_hit, torch.sigmoid(self.rgbs), torch.sigmoid(self.opacities), self.H, self.W)
-            loss = mse_loss(out_img, self.gt_image)
+            out_img = RasterizeGaussians.apply(xys, depths, radii, conics, num_tiles_hit, torch.sigmoid(self.rgbs),
+                                               torch.sigmoid(self.opacities), self.H, self.W)
+            return out_img
+
+        for iter in range(iterations):
+            # out_img = _compute_out_image(self.viewmat)
+            # out_img2 = _compute_out_image(self.viewmat2)
+            # out_img3 = _compute_out_image(self.viewmat3)
+            # loss = mse_loss(out_img, self.gt_image) + mse_loss(out_img2, self.gt_image)
+            name_to_out_img = {
+                camera.name: _compute_out_image(camera.viewmat)
+                for camera in [c for c in self.data] + self.debug_cameras
+            }
+            loss = sum([
+                mse_loss(name_to_out_img[camera.name], image)
+                for image, camera in self.data
+            ])
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -121,21 +183,80 @@ class SimpleTrainer:
             print("OPACITY MIN", self.opacities.min().item(), "OPACITY MAX", self.opacities.max().item())
             #same line but for out_img
             print("OUT_IMG MIN", out_img.min().item(), "OUT_IMG MAX", out_img.max().item())
-            if save_imgs and iter % 5 == 0:
-                frames.append((out_img.detach().cpu().numpy() * 255).astype(np.uint8))
+            if save_imgs and iter % (iterations // 25) == 0:
+                # frames.append((out_img.detach().cpu().numpy() * 255).astype(np.uint8))
+                for name, out_img in name_to_out_img.items():
+                    name_to_frames[name].append((out_img.detach().cpu().numpy() * 255).astype(np.uint8))
+                # name_to_frames["right"].append((out_img2.detach().cpu().numpy() * 255).astype(np.uint8))
+                # name_to_frames["skew"].append((out_img3.detach().cpu().numpy() * 255).astype(np.uint8))
         if save_imgs:
             #save them as a gif with PIL
-            frames = [Image.fromarray(frame) for frame in frames]
-            frames[0].save(os.getcwd() + f"/renders/training.gif", save_all=True, append_images=frames[1:], optimize=False, duration=5, loop=0)
+            for name, frames in name_to_frames.items():
+                frames = [Image.fromarray(frame) for frame in frames]
+                # save_dir = os.getcwd() + "/renders"
+                save_path = Path.cwd() / "renders" / f"{name}.gif"
+                # save_path = Path(os.getcwd() + f"/renders/{name}.gif")
+                if not save_path.parent.exists():
+                    save_path.parent.mkdir()
+                frames[0].save(str(save_path), save_all=True, append_images=frames[1:], optimize=False, duration=5, loop=0)
+
 
 
 
 
 if __name__ == "__main__":
-    gt_image = torch.ones((256, 256, 3)) * 1.0
+    WIDTH = 48
+    HEIGHT = 48
+    print(f"WIDTH: {WIDTH}, HEIGHT: {HEIGHT}")
+    gt_image = torch.ones((HEIGHT, WIDTH, 3)) * 1.0
     #make top left and bottom right red,blue
-    gt_image[:128, :128, :] = torch.tensor([1.0, 0.0, 0.0])
-    gt_image[128:, 128:, :] = torch.tensor([0.0, 0.0, 1.0])
-    trainer = SimpleTrainer(gt_image=gt_image)
+    gt_image[:HEIGHT // 2, :WIDTH // 2, :] = torch.tensor([1.0, 0.0, 0.0])
+    gt_image[HEIGHT // 2:, WIDTH // 2:, :] = torch.tensor([0.0, 0.0, 1.0])
+    theta = np.pi / 4
+    input = [
+        PosedImage(
+            image=gt_image,
+            camera=Camera(
+                viewmat=torch.tensor(
+                    [
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 8.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ],
+                ),
+                name="front",
+            ),
+        ),
+        # PosedImage(
+        #     image=gt_image,
+        #     camera=Camera(
+        #         viewmat=torch.tensor(
+        #             [
+        #                 [ 0.,  0.,  1.,  8.],
+        #                 [ 0.,  1.,  0.,  0.],
+        #                 [-1.,  0.,  0.,  0.],
+        #                 [ 0.,  0.,  0.,  1.]
+        #             ]
+        #         ),
+        #         name="right",
+        #     )
+        # ),
+    ]
+    debug_cameras = [
+        Camera(
+            viewmat=torch.tensor(
+                [
+                    [np.cos(theta), 0., np.sin(theta), 4.],
+                    [0., 1., 0., 0.],
+                    [-np.sin(theta), 0., np.cos(theta), 4.],
+                    [0., 0., 0., 1.]
+                ]
+            ),
+            name="skew",
+        ),
+    ]
+    # trainer = SimpleTrainer(gt_image=gt_image)
+    trainer = SimpleTrainer(data=input, debug_cameras=debug_cameras)
 
     trainer.train()
