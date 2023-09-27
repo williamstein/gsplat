@@ -4,14 +4,15 @@ import random
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
+import tyro
+from diff_rast.project_gaussians import ProjectGaussians
+from diff_rast.rasterize import RasterizeGaussians
 from PIL import Image
 from torch import Tensor, optim
-
-from diff_rast.rasterize import RasterizeGaussians
-from diff_rast.project_gaussians import ProjectGaussians
 
 
 @dataclass
@@ -56,7 +57,11 @@ class SimpleTrainer:
         BLOCK_X, BLOCK_Y = 16, 16
         fov_x = math.pi / 2.0
         self.focal = 0.5 * float(self.W) / math.tan(0.5 * fov_x)
-        self.tile_bounds = (self.W + BLOCK_X - 1) // BLOCK_X, (self.H + BLOCK_Y - 1) // BLOCK_Y, 1
+        self.tile_bounds = (
+            (self.W + BLOCK_X - 1) // BLOCK_X,
+            (self.H + BLOCK_Y - 1) // BLOCK_Y,
+            1,
+        )
         self.img_size = torch.tensor([self.W, self.H, 1], device=self.device)
         self.block = torch.tensor([BLOCK_X, BLOCK_Y, 1], device=self.device)
 
@@ -79,8 +84,12 @@ class SimpleTrainer:
                 ],
                 device=self.device,
             )
-            self.scales[i] = torch.tensor([random.random(), random.random(), random.random()], device=self.device)
-            self.rgbs[i] = torch.tensor([random.random(), random.random(), random.random()], device=self.device)
+            self.scales[i] = torch.tensor(
+                [random.random(), random.random(), random.random()], device=self.device
+            )
+            self.rgbs[i] = torch.tensor(
+                [random.random(), random.random(), random.random()], device=self.device
+            )
             u = random.random()
             v = random.random()
             w = random.random()
@@ -138,7 +147,9 @@ class SimpleTrainer:
         im.save(image_path)
 
     def train(self, iterations: int = 1000, lr: float = 0.01, save_imgs: bool = True):
-        optimizer = optim.Adam([self.rgbs,self.means,self.scales,self.opacities,self.quats], lr)  # try training self.opacities/scales etc.
+        optimizer = optim.Adam(
+            [self.rgbs, self.means, self.scales, self.opacities, self.quats], lr
+        )  # try training self.opacities/scales etc.
         mse_loss = torch.nn.MSELoss()
         name_to_frames = defaultdict(list)
         # frames = []
@@ -180,9 +191,16 @@ class SimpleTrainer:
             optimizer.step()
             print(f"Iteration {iter + 1}/{iterations}, Loss: {loss.item()}")
             print("RGB MIN", self.rgbs.min().item(), "RGB MAX", self.rgbs.max().item())
-            print("OPACITY MIN", self.opacities.min().item(), "OPACITY MAX", self.opacities.max().item())
-            #same line but for out_img
-            print("OUT_IMG MIN", out_img.min().item(), "OUT_IMG MAX", out_img.max().item())
+            print(
+                "OPACITY MIN",
+                self.opacities.min().item(),
+                "OPACITY MAX",
+                self.opacities.max().item(),
+            )
+            # same line but for out_img
+            print(
+                "OUT_IMG MIN", out_img.min().item(), "OUT_IMG MAX", out_img.max().item()
+            )
             if save_imgs and iter % (iterations // 25) == 0:
                 # frames.append((out_img.detach().cpu().numpy() * 255).astype(np.uint8))
                 for name, out_img in name_to_out_img.items():
@@ -201,18 +219,12 @@ class SimpleTrainer:
                 frames[0].save(str(save_path), save_all=True, append_images=frames[1:], optimize=False, duration=5, loop=0)
 
 
+def main(height: int = 256, width: int = 256) -> None:
+    gt_image = torch.ones((height, width, 3)) * 1.0
+    # make top left and bottom right red,blue
+    gt_image[: height // 2, : width // 2, :] = torch.tensor([1.0, 0.0, 0.0])
+    gt_image[height // 2 :, width // 2 :, :] = torch.tensor([0.0, 0.0, 1.0])
 
-
-
-if __name__ == "__main__":
-    WIDTH = 48
-    HEIGHT = 48
-    print(f"WIDTH: {WIDTH}, HEIGHT: {HEIGHT}")
-    gt_image = torch.ones((HEIGHT, WIDTH, 3)) * 1.0
-    #make top left and bottom right red,blue
-    gt_image[:HEIGHT // 2, :WIDTH // 2, :] = torch.tensor([1.0, 0.0, 0.0])
-    gt_image[HEIGHT // 2:, WIDTH // 2:, :] = torch.tensor([0.0, 0.0, 1.0])
-    theta = np.pi / 4
     input = [
         PosedImage(
             image=gt_image,
@@ -256,7 +268,9 @@ if __name__ == "__main__":
             name="skew",
         ),
     ]
-    # trainer = SimpleTrainer(gt_image=gt_image)
     trainer = SimpleTrainer(data=input, debug_cameras=debug_cameras)
-
     trainer.train()
+
+
+if __name__ == "__main__":
+    tyro.cli(main)
